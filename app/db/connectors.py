@@ -8,22 +8,34 @@ class DuckDBConnector(DatabaseConnector):
         import duckdb
         import os
         self.conn = duckdb.connect(database=":memory:", read_only=False)
-        # Extensions are usually pre-installed via lifespan or persistent on disk
-        # We only LOAD here to be safe, which is much faster than INSTALL
-        try:
-            self.conn.execute("LOAD httpfs;")
-            self.conn.execute("LOAD azure;")
-            # Improve HTTP reliability
-            self.conn.execute("SET http_keep_alive=false;")
-            self.conn.execute("SET http_retries=3;")
-            self.conn.execute("SET http_timeout=30000;")
-            
-            # Configure Azure if connection string is available
-            conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-            if conn_str:
+        self._httpfs_available = False
+
+        # Install + load httpfs/azure — INSTALL is a no-op if already cached
+        for ext in ("httpfs", "azure"):
+            try:
+                self.conn.execute(f"INSTALL {ext};")
+                self.conn.execute(f"LOAD {ext};")
+                if ext == "httpfs":
+                    self._httpfs_available = True
+            except Exception as e:
+                print(f"Warning: DuckDB extension '{ext}' unavailable: {e}")
+
+        if self._httpfs_available:
+            try:
+                self.conn.execute("SET http_keep_alive=false;")
+                self.conn.execute("SET http_retries=3;")
+                self.conn.execute("SET http_timeout=30000;")
+            except Exception:
+                pass
+
+        # Configure Azure storage if connection string is available
+        conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+        if conn_str:
+            try:
                 self.conn.execute(f"SET azure_storage_connection_string='{conn_str}';")
-        except:
-            pass
+            except Exception as e:
+                print(f"Warning: Failed to set Azure storage connection string: {e}")
+
         self._schema_cache: str | None = None
 
     async def connect(self):
@@ -33,6 +45,9 @@ class DuckDBConnector(DatabaseConnector):
         data_path = settings.DUCKDB_DATA_PATH
         if data_path.startswith("http"):
             # Single remote file mode
+            if not self._httpfs_available:
+                print(f"Warning: httpfs extension unavailable — cannot load remote file {data_path}")
+                return
             loop = asyncio.get_event_loop()
             def _load_remote():
                 table = "data"

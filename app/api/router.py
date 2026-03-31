@@ -180,34 +180,37 @@ async def run_task(payload: dict):
                 file_format = source_info.get("format", "csv")
 
                 if file_path:
+                    loaded = False
                     try:
                         if file_format == "csv":
-                            db.conn.execute(
+                            await db.execute(
                                 f"CREATE OR REPLACE TABLE \"{table_name}\" AS "
                                 f"SELECT * FROM read_csv_auto('{file_path}')"
                             )
                         elif file_format == "parquet":
-                            db.conn.execute(
+                            await db.execute(
                                 f"CREATE OR REPLACE TABLE \"{table_name}\" AS "
                                 f"SELECT * FROM read_parquet('{file_path}')"
                             )
+                        loaded = True
                     except Exception as load_err:
                         print(f"Warning: Failed to load data for {table_name} from {file_path}: {load_err}")
-                        # Fallback to schema-only handled by process_query
+
+                    # If remote load failed, ensure the empty schema table still exists
+                    if not loaded:
+                        matching_stmts = [s for s in schema_parts if f'"{table_name}"' in s]
+                        for stmt in matching_stmts:
+                            try:
+                                await db.execute(stmt)
+                            except Exception as e:
+                                print(f"Warning: Failed fallback CREATE TABLE: {e}")
 
         # Ensure all tables are created even if data loading was skipped or failed
-        if schema_parts and settings.DB_DIALECT.lower() == "duckdb":
-            for stmt in schema_parts:
-                try:
-                    db.conn.execute(stmt)
-                except Exception as e:
-                    print(f"Warning: Failed fallback CREATE TABLE: {e}")
-        elif schema_parts:
-            for stmt in schema_parts:
-                try:
-                    await db.execute(stmt)
-                except:
-                    pass
+        for stmt in schema_parts:
+            try:
+                await db.execute(stmt)
+            except Exception:
+                pass
         
         # Process the query using the active DB connection
         try:
