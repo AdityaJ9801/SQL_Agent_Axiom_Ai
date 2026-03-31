@@ -196,7 +196,13 @@ async def run_task(payload: dict):
                         # Fallback to schema-only handled by process_query
 
         # Ensure all tables are created even if data loading was skipped or failed
-        if schema_parts:
+        if schema_parts and settings.DB_DIALECT.lower() == "duckdb":
+            for stmt in schema_parts:
+                try:
+                    db.conn.execute(stmt)
+                except Exception as e:
+                    print(f"Warning: Failed fallback CREATE TABLE: {e}")
+        elif schema_parts:
             for stmt in schema_parts:
                 try:
                     await db.execute(stmt)

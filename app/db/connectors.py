@@ -6,12 +6,22 @@ from app.config import settings
 class DuckDBConnector(DatabaseConnector):
     def __init__(self):
         import duckdb
+        import os
         self.conn = duckdb.connect(database=":memory:", read_only=False)
         # Extensions are usually pre-installed via lifespan or persistent on disk
         # We only LOAD here to be safe, which is much faster than INSTALL
         try:
             self.conn.execute("LOAD httpfs;")
             self.conn.execute("LOAD azure;")
+            # Improve HTTP reliability
+            self.conn.execute("SET http_keep_alive=false;")
+            self.conn.execute("SET http_retries=3;")
+            self.conn.execute("SET http_timeout=30000;")
+            
+            # Configure Azure if connection string is available
+            conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+            if conn_str:
+                self.conn.execute(f"SET azure_storage_connection_string='{conn_str}';")
         except:
             pass
         self._schema_cache: str | None = None
@@ -109,10 +119,11 @@ class DuckDBConnector(DatabaseConnector):
                 data_rows = rel.limit(max_rows).fetchall()
                 data = [dict(zip(columns, row)) for row in data_rows]
                 total_rows = len(data) # Accurate enough for preview
-                # Try to get total rows if possible
+                # Try to get total rows if possible for SELECT/WITH queries only
                 try:
                     clean_sql = sql.strip().rstrip(';')
-                    total_rows = self.conn.sql(f"SELECT COUNT(*) FROM ({clean_sql})").fetchone()[0]
+                    if clean_sql.upper().startswith(("SELECT", "WITH")):
+                        total_rows = self.conn.sql(f"SELECT COUNT(*) FROM ({clean_sql})").fetchone()[0]
                 except:
                     pass
                 return columns, data, total_rows
