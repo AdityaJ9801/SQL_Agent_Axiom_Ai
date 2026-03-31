@@ -10,16 +10,22 @@ from app.llm.summarizer import generate_summary
 from app.core.models import QueryResult
 
 def transpile_sql(sql: str, to_dialect: str) -> str:
-    """Transpile generic SQL to target dialect using SQLGlot"""
+    """Transpile SQL to target dialect using SQLGlot, with DATEADD normalization."""
     valid_dialects = ["postgresql", "mysql", "sqlite", "duckdb", "snowflake", "bigquery"]
     if to_dialect.lower() not in valid_dialects:
-        return sql # No-op or handle appropriately
-    
+        return sql
+
     try:
-        # sqlglot reads "generic" by default if not specified or might try to guess
-        return sqlglot.transpile(sql, read="postgres", write=to_dialect.lower())[0]
+        # Try tsql first (catches DATEADD, ISNULL, etc.), fall back to generic
+        for read_dialect in ("tsql", "mysql", None):
+            try:
+                result = sqlglot.transpile(sql, read=read_dialect, write=to_dialect.lower())[0]
+                if result:
+                    return result
+            except Exception:
+                continue
+        return sql
     except Exception:
-        # Fallback to original if sqlglot transpile fails to parse
         return sql
 
 def calculate_summary_stats(data: list) -> dict:

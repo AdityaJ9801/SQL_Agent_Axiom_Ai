@@ -7,14 +7,46 @@ from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
 from langchain_community.chat_models import ChatOllama
 
+_DIALECT_HINTS: dict[str, str] = {
+    "duckdb": (
+        "DuckDB-specific rules:\n"
+        "- Date arithmetic: use `date_add(col, INTERVAL N DAY/MONTH/YEAR)` or `col + INTERVAL '7' DAY` — NEVER use DATEADD()\n"
+        "- Date truncation: `date_trunc('month', col)` — NOT TRUNC()\n"
+        "- Current date: `CURRENT_DATE` or `today()`\n"
+        "- String → date cast: `CAST(col AS DATE)` or `col::DATE` — NEVER compare VARCHAR date columns directly to date literals without casting\n"
+        "- Extract parts: `EXTRACT(YEAR FROM col)` or `YEAR(col)`\n"
+        "- String functions: `regexp_matches()`, `string_split()`, `list_aggregate()`\n"
+        "- If a column dtype is VARCHAR but contains dates (e.g. '2024-01-05'), always cast: `CAST(col AS DATE)`"
+    ),
+    "postgresql": (
+        "PostgreSQL-specific rules:\n"
+        "- Date arithmetic: `col + INTERVAL '7 days'` — NEVER use DATEADD()\n"
+        "- Date truncation: `date_trunc('month', col)`\n"
+        "- Current date: `CURRENT_DATE`\n"
+        "- Cast: `col::DATE` or `CAST(col AS DATE)`"
+    ),
+    "sqlite": (
+        "SQLite-specific rules:\n"
+        "- Date arithmetic: `date(col, '+7 days')` — NEVER use DATEADD()\n"
+        "- Current date: `date('now')`\n"
+        "- No native DATE type — dates are stored as TEXT, use `date()` functions"
+    ),
+}
+
+
 def generate_prompt(task: str, schema: str, dialect: str, max_rows: int = 1000) -> str:
+    dialect_hint = _DIALECT_HINTS.get(dialect.lower(), f"Use standard {dialect} SQL syntax.")
     return f"""You are a senior SQL analyst. Generate a single SQL SELECT query to answer the user's request.
 
 Database dialect: {dialect}
-Available tables and schema: {schema}
+Available tables and schema:
+{schema}
+
 User request: {task}
 
-Rules:
+{dialect_hint}
+
+General rules:
 1. Generate ONLY a SELECT query — no INSERT, UPDATE, DELETE, DROP, CREATE
 2. Always include LIMIT {max_rows} unless user explicitly asks for all rows
 3. Use column names exactly as shown in schema
@@ -66,9 +98,10 @@ async def generate_sql(task: str, schema: str, dialect: str) -> str:
     return sql
 
 async def correct_sql(sql: str, error_msg: str, task: str, schema: str, dialect: str) -> str:
-    prompt = f"""The following SQL query generated for the task '{task}' resulted in an error when executing on {dialect}.
+    dialect_hint = _DIALECT_HINTS.get(dialect.lower(), f"Use standard {dialect} SQL syntax.")
+    prompt = f"""The following SQL query for '{task}' failed on {dialect}.
 
-Query:
+Original query:
 {sql}
 
 Error:
@@ -77,7 +110,14 @@ Error:
 Schema:
 {schema}
 
-Please correct the query. Output ONLY the raw SQL code. No markdown fences, no explanations.
+{dialect_hint}
+
+Fix the query. Common causes:
+- DATEADD() is not valid in {dialect} — use the dialect-specific date function above
+- VARCHAR date columns must be cast before comparison: CAST(col AS DATE)
+- Function names are case-sensitive in some dialects
+
+Output ONLY the corrected raw SQL. No markdown, no explanation.
 """
     corrected_sql = await _call_llm(prompt)
     if not corrected_sql:

@@ -119,7 +119,7 @@ async def run_task(payload: dict):
                 # Extract source information from metadata
                 metadata = dep_result.get("metadata", {})
                 source_info = metadata.get("source")
-                
+
                 # Build schema_context from ContextObject
                 columns = dep_result.get("columns", [])
                 if columns:
@@ -128,9 +128,10 @@ async def run_task(payload: dict):
                     for col in columns:
                         col_name = col.get("name", "unknown")
                         dtype = col.get("dtype", "VARCHAR")
-                        
+                        semantic = col.get("semantic_type", "")
+
                         # Map pandas/python dtypes to SQL types
-                        sql_type = dtype
+                        # semantic_type takes priority for ambiguous object columns
                         if "int" in dtype.lower():
                             sql_type = "INTEGER"
                         elif "float" in dtype.lower() or "double" in dtype.lower():
@@ -138,56 +139,81 @@ async def run_task(payload: dict):
                         elif "bool" in dtype.lower():
                             sql_type = "BOOLEAN"
                         elif "date" in dtype.lower() or "time" in dtype.lower():
-                            sql_type = "TIMESTAMP"
-                        elif "object" in dtype.lower() or "str" in dtype.lower():
+                            sql_type = "DATE"
+                        elif semantic in ("datetime", "date", "timestamp"):
+                            # object/string column that contains date strings — keep as VARCHAR
+                            # but annotate so LLM knows to cast it
+                            sql_type = "VARCHAR -- contains date strings, cast with CAST(col AS DATE)"
+                        else:
                             sql_type = "VARCHAR"
-                        
-                        col_defs.append(f"{col_name} {sql_type}")
+
+                        col_defs.append(f'"{col_name}" {sql_type}')
+
+                    # Derive table name — prefer the actual filename from source path,
+                    # fall back to source_id. The DuckDB connector loads files using
+                    # the filename stem as the table name (e.g. "sales.csv" → "sales").
+                    table_name = "data_table"
+                    if source_info:
+                        raw_path = source_info.get("path", "")
+                        # Extract stem from URL or file path: ".../bf7dccfa_sales.csv" → "bf7dccfa_sales"
+                        stem = raw_path.rstrip("/").split("/")[-1].split(".")[0]
+                        if stem:
+                            table_name = stem
                     
-                    # Infer table name from source_id
-                    source_id = dep_result.get("source_id", "data_table")
-                    # Extract filename without extension from source_id
-                    table_name = source_id.split(":")[-1].split("/")[-1].split(".")[0]
-                    
-                    # Ensure table_name is a valid SQL identifier
+                    if table_name == "data_table":
+                        # Fall back to source_id last segment
+                        source_id = dep_result.get("source_id", "data_table")
+                        table_name = source_id.split(":")[-1].split("/")[-1].split(".")[0] or "data_table"
+
+                    # Sanitize to valid SQL identifier
                     import re
                     table_name = re.sub(r'[^a-zA-Z0-9_]', '_', table_name)
-                    if not table_name or table_name == "":
+                    if not table_name:
                         table_name = "data_table"
                     elif table_name[0].isdigit():
                         table_name = f"t_{table_name}"
-                    
+
                     schema_context = f"CREATE TABLE {table_name} ({', '.join(col_defs)});"
                     break
         
         # If we have source info, load the data into the database
         db = get_database_connector()
         await db.connect()
-        
-        if source_info:
-            # Load data based on source type
-            if source_info.get("type") == "local_file":
-                file_path = source_info.get("path")
-                file_format = source_info.get("format", "csv")
-                
-                if file_path:
-                    # For DuckDB, load the file directly into a table
-                    if settings.DB_DIALECT.lower() == "duckdb":
+
+        if source_info and settings.DB_DIALECT.lower() == "duckdb":
+            src_type = source_info.get("type", "")
+            file_path = source_info.get("path", "")
+            file_format = source_info.get("format", "csv")
+
+            if file_path:
+                try:
+                    if file_format == "csv":
+                        db.conn.execute(
+                            f'CREATE OR REPLACE TABLE "{table_name}" AS '
+                            f"SELECT * FROM read_csv_auto('{file_path}')"
+                        )
+                    elif file_format == "parquet":
+                        db.conn.execute(
+                            f'CREATE OR REPLACE TABLE "{table_name}" AS '
+                            f"SELECT * FROM read_parquet('{file_path}')"
+                        )
+                    else:
+                        # Unknown format — create empty schema so SQL generation still works
                         try:
-                            if file_format == "csv":
-                                db.conn.execute(
-                                    f"CREATE OR REPLACE TABLE {table_name} AS "
-                                    f"SELECT * FROM read_csv_auto('{file_path}')"
-                                )
-                            elif file_format == "parquet":
-                                db.conn.execute(
-                                    f"CREATE OR REPLACE TABLE {table_name} AS "
-                                    f"SELECT * FROM read_parquet('{file_path}')"
-                                )
-                        except Exception as file_err:
-                            print(f"Failed to load data file '{file_path}': {file_err}")
-                            # Even if loading the mock file fails during test, we can still define the table schema so generating SQL works
                             db.conn.execute(schema_context)
+                        except Exception:
+                            pass
+                except Exception as load_err:
+                    # File unreachable — create schema-only table so LLM can still generate SQL
+                    try:
+                        db.conn.execute(schema_context)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    db.conn.execute(schema_context)
+                except Exception:
+                    pass
         
         # Process the query using the active DB connection
         result = await process_query(task_description, schema_context, db_conn=db)
