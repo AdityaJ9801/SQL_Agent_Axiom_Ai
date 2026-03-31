@@ -105,26 +105,6 @@ async def aggregate_query(req: AggregateRequest):
 async def run_task(payload: dict):
     """
     Orchestrator-compatible endpoint that receives enriched task payloads.
-    
-    Expected payload structure:
-    {
-        "query": "...",  # or "task_description": "..."
-        "_context": {
-            "t01": { # Context agent result (ContextObject)
-                "source_id": "...",
-                "source_type": "...",
-                "columns": [{"name": "...", "dtype": "..."}, ...],
-                "row_count": 123,
-                "metadata": {
-                    "source": { # Original DataSource object
-                        "type": "local_file",
-                        "path": "...",
-                        "format": "csv"
-                    }
-                }
-            }
-        }
-    }
     """
     try:
         # Extract task description (could be "query" or "task_description")
@@ -133,12 +113,11 @@ async def run_task(payload: dict):
             raise HTTPException(status_code=400, detail="task_description or query is required")
         
         # Extract schema_context and source info from dependency results
-        schema_context = None
-        source_info = None
-        table_name = "data_table"
+        schema_parts = []
+        sources_to_load = []
         context_data = payload.get("_context", {})
         
-        # Look for context agent result in dependencies
+        # Look for context agent results in dependencies
         for dep_id, dep_result in context_data.items():
             if isinstance(dep_result, dict) and "columns" in dep_result:
                 # Extract source information from metadata
@@ -156,26 +135,22 @@ async def run_task(payload: dict):
                         semantic = col.get("semantic_type", "")
 
                         # Map pandas/python dtypes to SQL types
-                        # semantic_type takes priority for ambiguous object columns
                         if "int" in dtype.lower():
                             sql_type = "INTEGER"
-                        elif "float" in dtype.lower() or "double" in dtype.lower():
+                        elif "float" in dtype.lower() or "double" in dtype.lower() or "decimal" in dtype.lower():
                             sql_type = "DOUBLE"
                         elif "bool" in dtype.lower():
                             sql_type = "BOOLEAN"
                         elif "date" in dtype.lower() or "time" in dtype.lower():
                             sql_type = "DATE"
                         elif semantic in ("datetime", "date", "timestamp"):
-                            # object/string column that contains date strings — keep as VARCHAR
-                            # but annotate so LLM knows to cast it
                             sql_type = "VARCHAR -- contains date strings, cast with CAST(col AS DATE)"
                         else:
                             sql_type = "VARCHAR"
 
                         col_defs.append(f'"{col_name}" {sql_type}')
 
-                    # Derive a clean, predictable table name from the source path or source_id.
-                    # e.g. ".../95b1734e_sales.csv" → "sales"
+                    # Derive a clean, predictable table name
                     table_name = "dataset"
                     if source_info:
                         raw_path = source_info.get("path", "")
@@ -189,54 +164,64 @@ async def run_task(payload: dict):
                         if stem:
                             table_name = _clean_table_name(stem)
 
-                    schema_context = f"CREATE TABLE {table_name} ({', '.join(col_defs)});"
-                    break
+                    schema_parts.append(f"CREATE TABLE IF NOT EXISTS \"{table_name}\" ({', '.join(col_defs)});")
+                    if source_info:
+                        sources_to_load.append((table_name, source_info))
         
+        schema_context = "\n".join(schema_parts) if schema_parts else None
+
         # If we have source info, load the data into the database
         db = get_database_connector()
         await db.connect()
 
-        if source_info and settings.DB_DIALECT.lower() == "duckdb":
-            file_path = source_info.get("path", "")
-            file_format = source_info.get("format", "csv")
+        if sources_to_load and settings.DB_DIALECT.lower() == "duckdb":
+            for table_name, source_info in sources_to_load:
+                file_path = source_info.get("path", "")
+                file_format = source_info.get("format", "csv")
 
-            if file_path:
-                try:
-                    if file_format == "csv":
-                        db.conn.execute(
-                            f"CREATE OR REPLACE TABLE {table_name} AS "
-                            f"SELECT * FROM read_csv_auto('{file_path}')"
-                        )
-                    elif file_format == "parquet":
-                        db.conn.execute(
-                            f"CREATE OR REPLACE TABLE {table_name} AS "
-                            f"SELECT * FROM read_parquet('{file_path}')"
-                        )
-                    else:
-                        db.conn.execute(schema_context)
-                except Exception as load_err:
-                    # File unreachable — fall back to schema-only so LLM can still generate SQL
-                    # but queries will return 0 rows
+                if file_path:
                     try:
-                        db.conn.execute(schema_context)
-                    except Exception:
-                        pass
-            else:
+                        if file_format == "csv":
+                            db.conn.execute(
+                                f"CREATE OR REPLACE TABLE \"{table_name}\" AS "
+                                f"SELECT * FROM read_csv_auto('{file_path}')"
+                            )
+                        elif file_format == "parquet":
+                            db.conn.execute(
+                                f"CREATE OR REPLACE TABLE \"{table_name}\" AS "
+                                f"SELECT * FROM read_parquet('{file_path}')"
+                            )
+                    except Exception as load_err:
+                        print(f"Warning: Failed to load data for {table_name} from {file_path}: {load_err}")
+                        # Fallback to schema-only handled by process_query
+
+        # Ensure all tables are created even if data loading was skipped or failed
+        if schema_parts:
+            for stmt in schema_parts:
                 try:
-                    db.conn.execute(schema_context)
-                except Exception:
+                    await db.execute(stmt)
+                except:
                     pass
         
         # Process the query using the active DB connection
-        result = await process_query(task_description, schema_context, db_conn=db)
-        await db.close()
-        return result
+        try:
+            result = await process_query(task_description, schema_context, db_conn=db)
+            await db.close()
+            return result
+        except Exception as e:
+            await db.close()
+            raise e
         
     except SQLSafetyError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except SQLExecutionError as e:
+        print(f"SQLExecutionError in /run: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     except SQLGenerationError as e:
+        print(f"SQLGenerationError in /run: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
+        print(f"Unexpected error in /run: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")

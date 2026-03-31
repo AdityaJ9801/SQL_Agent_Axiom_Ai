@@ -7,7 +7,13 @@ class DuckDBConnector(DatabaseConnector):
     def __init__(self):
         import duckdb
         self.conn = duckdb.connect(database=":memory:", read_only=False)
-        self.conn.execute("INSTALL httpfs; LOAD httpfs;")
+        # Extensions are usually pre-installed via lifespan or persistent on disk
+        # We only LOAD here to be safe, which is much faster than INSTALL
+        try:
+            self.conn.execute("LOAD httpfs;")
+            self.conn.execute("LOAD azure;")
+        except:
+            pass
         self._schema_cache: str | None = None
 
     async def connect(self):
@@ -21,9 +27,9 @@ class DuckDBConnector(DatabaseConnector):
             def _load_remote():
                 table = "data"
                 if data_path.endswith(".csv"):
-                    self.conn.execute(f"CREATE OR REPLACE TABLE {table} AS SELECT * FROM read_csv_auto('{data_path}')")
+                    self.conn.execute(f"CREATE OR REPLACE TABLE \"{table}\" AS SELECT * FROM read_csv_auto('{data_path}')")
                 elif data_path.endswith(".parquet"):
-                    self.conn.execute(f"CREATE OR REPLACE TABLE {table} AS SELECT * FROM read_parquet('{data_path}')")
+                    self.conn.execute(f"CREATE OR REPLACE TABLE \"{table}\" AS SELECT * FROM read_parquet('{data_path}')")
             await loop.run_in_executor(None, _load_remote)
             return
 
@@ -75,9 +81,9 @@ class DuckDBConnector(DatabaseConnector):
                     f"DESCRIBE \"{tname}\""
                 ).fetchall()
                 col_defs = ", ".join(
-                    f"{c[0]} {c[1]}" for c in cols
+                    f"\"{c[0]}\" {c[1]}" for c in cols
                 )
-                lines.append(f"CREATE TABLE {tname} ({col_defs});")
+                lines.append(f"CREATE TABLE \"{tname}\" ({col_defs});")
             return " ".join(lines)
 
         schema = await loop.run_in_executor(None, _schema)
@@ -89,14 +95,30 @@ class DuckDBConnector(DatabaseConnector):
         loop = asyncio.get_event_loop()
 
         def _exec():
-            rel = self.conn.sql(sql)
-            if rel is None:
+            # Ensure it's not empty or pure whitespace to avoid Parser Error
+            if not sql or not sql.strip():
                 return [], [], 0
-            columns = rel.columns
-            df = rel.limit(max_rows).df()
-            data = df.to_dict(orient="records")
-            total_rows = len(data) if len(data) < max_rows else max_rows
-            return columns, data, total_rows
+            
+            try:
+                rel = self.conn.sql(sql)
+                if rel is None:
+                    return [], [], 0
+                columns = rel.columns
+                # Use fetchall and then convert to dict to avoid potential memory issues with large .df()
+                # or incompatible relations that don't support .df()
+                data_rows = rel.limit(max_rows).fetchall()
+                data = [dict(zip(columns, row)) for row in data_rows]
+                total_rows = len(data) # Accurate enough for preview
+                # Try to get total rows if possible
+                try:
+                    clean_sql = sql.strip().rstrip(';')
+                    total_rows = self.conn.sql(f"SELECT COUNT(*) FROM ({clean_sql})").fetchone()[0]
+                except:
+                    pass
+                return columns, data, total_rows
+            except Exception as e:
+                # Re-raise so process_query can catch it
+                raise e
 
         return await loop.run_in_executor(None, _exec)
 
