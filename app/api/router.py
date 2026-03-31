@@ -1,3 +1,4 @@
+import re
 from fastapi import APIRouter, HTTPException, Depends
 from app.core.models import QueryRequest, ExplainRequest, AggregateRequest, QueryResult
 from app.services.query_manager import process_query, explain_query
@@ -6,6 +7,30 @@ from app.db.connectors import get_database_connector
 from app.config import settings
 
 router = APIRouter()
+
+_HEX_PREFIX = re.compile(r'^[0-9a-f]{6,}_', re.IGNORECASE)
+
+
+def _clean_table_name(raw: str) -> str:
+    """Derive a clean SQL table name from a raw filename stem or source_id segment.
+
+    Examples:
+        "95b1734e_sales"  → "sales"
+        "bf7dccfa_sales"  → "sales"
+        "1346c6ad6297338b" → "dataset"   (pure hash, no meaningful suffix)
+        "sales"           → "sales"
+    """
+    # Strip leading hex hash prefix: "95b1734e_sales" → "sales"
+    clean = _HEX_PREFIX.sub("", raw)
+    # If nothing meaningful remains (pure hash), fall back
+    if not clean or clean == raw and re.fullmatch(r'[0-9a-f]+', raw, re.IGNORECASE):
+        clean = "dataset"
+    # Sanitize: only alphanumeric + underscore
+    clean = re.sub(r'[^a-zA-Z0-9_]', '_', clean).strip("_") or "dataset"
+    # No leading digit
+    if clean[0].isdigit():
+        clean = f"t_{clean}"
+    return clean
 
 @router.get("/health")
 async def health_check():
@@ -149,29 +174,20 @@ async def run_task(payload: dict):
 
                         col_defs.append(f'"{col_name}" {sql_type}')
 
-                    # Derive table name — prefer the actual filename from source path,
-                    # fall back to source_id. The DuckDB connector loads files using
-                    # the filename stem as the table name (e.g. "sales.csv" → "sales").
-                    table_name = "data_table"
+                    # Derive a clean, predictable table name from the source path or source_id.
+                    # e.g. ".../95b1734e_sales.csv" → "sales"
+                    table_name = "dataset"
                     if source_info:
                         raw_path = source_info.get("path", "")
-                        # Extract stem from URL or file path: ".../bf7dccfa_sales.csv" → "bf7dccfa_sales"
                         stem = raw_path.rstrip("/").split("/")[-1].split(".")[0]
                         if stem:
-                            table_name = stem
-                    
-                    if table_name == "data_table":
-                        # Fall back to source_id last segment
-                        source_id = dep_result.get("source_id", "data_table")
-                        table_name = source_id.split(":")[-1].split("/")[-1].split(".")[0] or "data_table"
+                            table_name = _clean_table_name(stem)
 
-                    # Sanitize to valid SQL identifier
-                    import re
-                    table_name = re.sub(r'[^a-zA-Z0-9_]', '_', table_name)
-                    if not table_name:
-                        table_name = "data_table"
-                    elif table_name[0].isdigit():
-                        table_name = f"t_{table_name}"
+                    if table_name == "dataset":
+                        source_id = dep_result.get("source_id", "")
+                        stem = source_id.split(":")[-1].split("/")[-1].split(".")[0]
+                        if stem:
+                            table_name = _clean_table_name(stem)
 
                     schema_context = f"CREATE TABLE {table_name} ({', '.join(col_defs)});"
                     break
@@ -181,7 +197,6 @@ async def run_task(payload: dict):
         await db.connect()
 
         if source_info and settings.DB_DIALECT.lower() == "duckdb":
-            src_type = source_info.get("type", "")
             file_path = source_info.get("path", "")
             file_format = source_info.get("format", "csv")
 
@@ -189,22 +204,19 @@ async def run_task(payload: dict):
                 try:
                     if file_format == "csv":
                         db.conn.execute(
-                            f'CREATE OR REPLACE TABLE "{table_name}" AS '
+                            f"CREATE OR REPLACE TABLE {table_name} AS "
                             f"SELECT * FROM read_csv_auto('{file_path}')"
                         )
                     elif file_format == "parquet":
                         db.conn.execute(
-                            f'CREATE OR REPLACE TABLE "{table_name}" AS '
+                            f"CREATE OR REPLACE TABLE {table_name} AS "
                             f"SELECT * FROM read_parquet('{file_path}')"
                         )
                     else:
-                        # Unknown format — create empty schema so SQL generation still works
-                        try:
-                            db.conn.execute(schema_context)
-                        except Exception:
-                            pass
+                        db.conn.execute(schema_context)
                 except Exception as load_err:
-                    # File unreachable — create schema-only table so LLM can still generate SQL
+                    # File unreachable — fall back to schema-only so LLM can still generate SQL
+                    # but queries will return 0 rows
                     try:
                         db.conn.execute(schema_context)
                     except Exception:

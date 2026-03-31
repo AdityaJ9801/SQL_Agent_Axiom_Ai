@@ -96,11 +96,15 @@ async def process_query(task: str, schema: Optional[str], db_conn=None) -> Query
                 except Exception:
                     pass
     else:
-        # We received a dynamic schema context. Ensure it gets created in the active memory connection to prevent catalog errors
+        # Schema was provided — ensure tables exist in this connection.
+        # Use IF NOT EXISTS so we never overwrite a table already loaded with real data.
         for statement in schema.strip().split(';'):
-            if statement.strip().upper().startswith("CREATE"):
+            stmt = statement.strip()
+            if stmt.upper().startswith("CREATE TABLE") and "IF NOT EXISTS" not in stmt.upper():
+                stmt = stmt.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
+            if stmt:
                 try:
-                    await db.execute(statement.strip())
+                    await db.execute(stmt)
                 except Exception:
                     pass
         
