@@ -32,6 +32,12 @@ app = FastAPI(
 
 app.include_router(router)
 
+# Root route: Azure Container Apps probes hit "/" by default.
+# Return 200 here so the container is never killed for a 404 on "/".
+@app.get("/", tags=["health"], include_in_schema=False)
+async def root():
+    return {"status": "ok", "service": "sql-agent"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host="0.0.0.0", port=settings.PORT, reload=True)

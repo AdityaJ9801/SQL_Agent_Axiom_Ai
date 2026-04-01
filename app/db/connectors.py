@@ -11,12 +11,15 @@ class DuckDBConnector(DatabaseConnector):
         self._httpfs_available = False
 
         # Install + load httpfs/azure — INSTALL is a no-op if already cached
+        self._azure_available = False
         for ext in ("httpfs", "azure"):
             try:
                 self.conn.execute(f"INSTALL {ext};")
                 self.conn.execute(f"LOAD {ext};")
                 if ext == "httpfs":
                     self._httpfs_available = True
+                elif ext == "azure":
+                    self._azure_available = True
             except Exception as e:
                 print(f"Warning: DuckDB extension '{ext}' unavailable: {e}")
 

@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     BIGQUERY_PROJECT_ID: Optional[str] = None
     BIGQUERY_DATASET: Optional[str] = None
     
+    # Azure Blob Storage — used by DuckDBConnector to authenticate az:// URLs
+    AZURE_STORAGE_CONNECTION_STRING: Optional[str] = None
+
     USE_DOCKER: bool = False
     USE_EC2: bool = False
     PORT: int = 8002
