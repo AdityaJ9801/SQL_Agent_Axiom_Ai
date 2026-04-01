@@ -1,9 +1,12 @@
+import os
 import re
+import asyncio
+import tempfile
 from fastapi import APIRouter, HTTPException
 from app.core.models import QueryRequest, ExplainRequest, AggregateRequest, QueryResult
 from app.services.query_manager import process_query, explain_query
 from app.core.exceptions import SQLSafetyError, SQLExecutionError, SQLGenerationError
-from app.db.connectors import get_database_connector, DuckDBConnector
+from app.db.connectors import get_database_connector
 from app.config import settings
 
 router = APIRouter()
@@ -12,20 +15,39 @@ _HEX_PREFIX = re.compile(r'^[0-9a-f]{6,}_', re.IGNORECASE)
 _AZURE_BLOB_RE = re.compile(r'https://[^.]+\.blob\.core\.windows\.net/([^/?]+)/(.+?)(\?.*)?$')
 
 
-def _to_duckdb_azure_url(url: str) -> str | None:
-    """Convert an Azure Blob HTTPS URL to DuckDB's az:// URL scheme.
+async def _download_azure_blob(blob_url: str, suffix: str = ".csv") -> str | None:
+    """Download a private Azure Blob to a temp file using the Python SDK.
 
-    DuckDB's httpfs extension makes unauthenticated HTTP GETs — private blobs
-    fail with HTTP 0. The Azure extension uses az:// together with the
-    AZURE_STORAGE_CONNECTION_STRING DuckDB setting to authenticate.
+    DuckDB's bundled libcurl fails SSL verification on python:3.11-slim because
+    ca-certificates may be missing. Python's azure-storage-blob uses the certifi
+    CA bundle and works reliably in all container environments.
 
-    Returns the az:// URL if this is an Azure blob URL, else None.
+    Returns the temp file path (caller must delete it), or None on failure.
     """
-    m = _AZURE_BLOB_RE.match(url)
-    if m:
-        container, blob_path = m.group(1), m.group(2)
-        return f"az://{container}/{blob_path}"
-    return None
+    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    if not conn_str:
+        return None
+
+    m = _AZURE_BLOB_RE.match(blob_url)
+    if not m:
+        return None
+
+    container, blob_name = m.group(1), m.group(2)
+
+    def _download() -> bytes:
+        from azure.storage.blob import BlobServiceClient
+        client = BlobServiceClient.from_connection_string(conn_str)
+        return client.get_blob_client(container=container, blob=blob_name).download_blob().readall()
+
+    try:
+        content = await asyncio.get_event_loop().run_in_executor(None, _download)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(content)
+        tmp.close()
+        return tmp.name
+    except Exception as exc:
+        print(f"Warning: Azure SDK blob download failed for {blob_url}: {exc}")
+        return None
 
 
 def _clean_table_name(raw: str) -> str:
@@ -199,31 +221,46 @@ async def run_task(payload: dict):
                 if not file_path:
                     continue
 
-                # Convert Azure Blob HTTPS URLs → az:// so DuckDB's Azure extension
-                # authenticates with AZURE_STORAGE_CONNECTION_STRING instead of making
-                # an unauthenticated HTTP GET that fails with "HTTP 0 Internal Server Error".
-                effective_path = file_path
-                if isinstance(db, DuckDBConnector) and db._azure_available:
-                    az_url = _to_duckdb_azure_url(file_path)
-                    if az_url:
-                        effective_path = az_url
-                        print(f"Info: Rewriting Azure blob URL for DuckDB: {file_path} → {az_url}")
-
                 loaded = False
+                tmp_path = None
                 try:
-                    if file_format == "csv":
-                        await db.execute(
-                            f"CREATE OR REPLACE TABLE \"{table_name}\" AS "
-                            f"SELECT * FROM read_csv_auto('{effective_path}')"
-                        )
-                    elif file_format == "parquet":
+                    # For Azure Blob URLs, download to a local temp file first.
+                    # This uses Python's azure-storage-blob SDK (and its certifi CA bundle)
+                    # instead of DuckDB's bundled libcurl, which fails SSL verification on
+                    # python:3.11-slim containers with "Problem with the SSL CA cert".
+                    is_azure_blob = bool(_AZURE_BLOB_RE.match(file_path))
+                    if is_azure_blob:
+                        suffix = f".{file_format}" if file_format else ".csv"
+                        tmp_path = await _download_azure_blob(file_path, suffix=suffix)
+                        effective_path = tmp_path if tmp_path else file_path
+                        if tmp_path:
+                            print(f"Info: Downloaded Azure blob to temp file: {file_path} → {tmp_path}")
+                        else:
+                            print(f"Warning: Azure SDK download failed, falling back to direct URL: {file_path}")
+                    else:
+                        effective_path = file_path
+
+                    if file_format == "parquet":
                         await db.execute(
                             f"CREATE OR REPLACE TABLE \"{table_name}\" AS "
                             f"SELECT * FROM read_parquet('{effective_path}')"
                         )
+                    else:
+                        # Default to CSV for unknown formats
+                        await db.execute(
+                            f"CREATE OR REPLACE TABLE \"{table_name}\" AS "
+                            f"SELECT * FROM read_csv_auto('{effective_path}')"
+                        )
                     loaded = True
                 except Exception as load_err:
-                    print(f"Warning: Failed to load data for {table_name} from {effective_path}: {load_err}")
+                    print(f"Warning: Failed to load data for {table_name}: {load_err}")
+                finally:
+                    # Always clean up temp files
+                    if tmp_path and os.path.exists(tmp_path):
+                        try:
+                            os.unlink(tmp_path)
+                        except Exception:
+                            pass
 
                 # If data load failed, create an empty schema table so the LLM
                 # still knows the column structure (it will just return no rows).
